@@ -9,7 +9,7 @@ https://docs.djangoproject.com/en/3.2/topics/settings/
 For the full list of settings and their values, see
 https://docs.djangoproject.com/en/3.2/ref/settings/
 """
-
+import os
 from pathlib import Path
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
@@ -20,12 +20,26 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # See https://docs.djangoproject.com/en/3.2/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-nw^y+m^wmxza1asgk+)!ua2qx9)g+#v=6%76-9i8i(6eqiw94j'
+SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "unsafe-dev-key")
+DEBUG = os.getenv("DJANGO_DEBUG", "0") == "1"
+
+
+STATIC_URL = "/static/"
+STATIC_ROOT = BASE_DIR / "staticfiles"
+
+MEDIA_URL = "/media/"
+MEDIA_ROOT = BASE_DIR / "media"
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = os.getenv("DJANGO_DEBUG", "0") == "1"
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = [
+    h.strip() for h in os.getenv(
+        "DJANGO_ALLOWED_HOSTS",
+        "localhost,127.0.0.1"
+    ).split(",")
+    if h.strip()
+]
 
 
 # Application definition
@@ -39,7 +53,7 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
 
     'rest_framework',
-
+    'django_filters',
     'logistic',
 ]
 
@@ -78,13 +92,14 @@ WSGI_APPLICATION = 'stocks_products.wsgi.application'
 # https://docs.djangoproject.com/en/3.2/ref/settings/#databases
 
 DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.postgresql',
-        'NAME': 'netology_stocks_products',
-        'USER': 'netology_stocks',
-        'PASSWORD': 'netology_stocks',
-        'HOST': '127.0.0.1',
-        'PORT': '5432',
+    "default": {
+"ENGINE": "django.db.backends.postgresql",
+        "NAME": os.getenv("POSTGRES_DB", "netology_stocks_products"),
+        "USER": os.getenv("POSTGRES_USER", "netology_stocks"),
+        "PASSWORD": os.getenv("POSTGRES_PASSWORD", ""),
+        "HOST": os.getenv("POSTGRES_HOST", "postgres"),  # имя сервиса в docker-compose
+        "PORT": os.getenv("POSTGRES_PORT", "5432"),
+        "CONN_MAX_AGE": int(os.getenv("POSTGRES_CONN_MAX_AGE", "60")),
     }
 }
 
@@ -125,7 +140,7 @@ USE_TZ = True
 # Static files (CSS, JavaScript, Images)
 # https://docs.djangoproject.com/en/3.2/howto/static-files/
 
-STATIC_URL = '/static/'
+# STATIC_URL = '/static/'
 
 # Default primary key field type
 # https://docs.djangoproject.com/en/3.2/ref/settings/#default-auto-field
@@ -144,4 +159,18 @@ REST_FRAMEWORK = {
     ],
 }
 
-# =====================
+# ===================== Для отлавливания ошибок
+
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "handlers": {"console": {"class": "logging.StreamHandler"}},
+    "loggers": {
+        "django.security.DisallowedHost": {
+            "handlers": ["console"],
+            "level": "ERROR",
+            "propagate": False,
+        }
+    },
+}
+
