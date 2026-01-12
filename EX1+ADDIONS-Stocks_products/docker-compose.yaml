@@ -1,0 +1,173 @@
+services:
+  # --- PostgreSQL: база данных проекта ---
+  postgres:
+    # Готовый официальный образ Postgres (alpine = компактный)
+    image: postgres:16-alpine
+
+    # Явное имя контейнера (удобно для логов/отладки)
+    container_name: hw76_postgres
+
+    # Параметры инициализации БД (берутся из .env)
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}             # имя базы
+      POSTGRES_USER: ${POSTGRES_USER}         # пользователь
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD} # пароль
+
+    # Том для постоянного хранения данных БД (переживает пересоздание контейнеров)
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+    # Healthcheck: контейнер считается "healthy", когда Postgres реально принимает подключения
+    # $$... — экранирование для docker-compose, чтобы переменные раскрывались ВНУТРИ контейнера, а не на хосте
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+    # Автоперезапуск при падениях/перезагрузке Docker Desktop
+    restart: unless-stopped
+
+    # База в "внутренней" сети (backend <-> postgres), наружу не публикуется
+    networks:
+      - back_net
+
+    # Запрещает повышать привилегии внутри контейнера (повышает безопасность)
+    security_opt:
+      - no-new-privileges:true
+
+
+  # --- Backend: Django + Gunicorn ---
+  backend:
+    # Собираем из Dockerfile в текущей папке
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    container_name: hw76_backend
+
+    # tini как init-процесс: корректно завершает/чистит дочерние процессы (полезно для gunicorn)
+    init: true
+
+    # Переменные окружения для подключения к БД и настройки Django
+    environment:
+      # ВАЖНО: host = имя сервиса postgres в docker-сети, а не 127.0.0.1
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+
+      # Django параметры (секреты и флаги — из .env)
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY}
+      DJANGO_DEBUG: ${DJANGO_DEBUG}                 # обычно 0 в .env для "безопасного" режима
+      DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS} # localhost,127.0.0.1
+      DJANGO_WSGI_MODULE: ${DJANGO_WSGI_MODULE}     # stocks_products.wsgi
+
+    # Том для статических файлов (collectstatic) и медиа (uploads)
+    # Эти тома потом подключаются read-only в nginx
+    volumes:
+      - static_volume:/app/staticfiles
+      - media_volume:/app/media
+
+    # Ждём пока Postgres станет healthy (иначе Django может стартовать раньше и упасть на коннекте)
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    restart: unless-stopped
+
+    # Backend сидит в двух сетях:
+    # - front_net: чтобы nginx мог ходить на backend
+    # - back_net: чтобы backend мог ходить на postgres
+    networks:
+      - front_net
+      - back_net
+
+    # /tmp в памяти (и writable) — полезно при ужесточении прав, и просто чище
+    tmpfs:
+      - /tmp
+
+    # Запрет повышения привилегий
+    security_opt:
+      - no-new-privileges:true
+
+    # Healthcheck: сервис healthy, когда backend реально отвечает по HTTP
+    # Проверяем /api/v1/ (внутри контейнера на 127.0.0.1:8000)
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/', timeout=2)\""]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+
+  # --- Nginx: reverse proxy + отдача статики/медиа ---
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: hw76_nginx
+    init: true
+
+    # Публикуем наружу 80, но внутри контейнера nginx слушает 8080 (для non-root)
+    ports:
+      - "80:8080"
+
+    # Стартуем nginx только когда backend healthy (иначе можно поймать 502 при старте)
+    depends_on:
+      backend:
+        condition: service_healthy
+
+    restart: unless-stopped
+
+    # Nginx находится только во "front" сети (ему не нужен доступ к БД)
+    networks:
+      - front_net
+
+    # Подключаем конфиги nginx с хоста (read-only)
+    # + подключаем тома со статикой и медиа (read-only)
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - static_volume:/var/www/static:ro
+      - media_volume:/var/www/media:ro
+
+    # Запускаем nginx без стандартных entrypoint-скриптов образа (они могут пытаться менять права/делать chown)
+    entrypoint: ["nginx", "-g", "daemon off;"]
+
+    # Запуск nginx от непривилегированного пользователя (UID/GID 101 — стандартно для nginx в alpine)
+    # ВАЖНО: поэтому nginx должен слушать порт 8080 внутри контейнера (порт 80 <1024 non-root не откроет)
+    user: "101:101"
+
+    # Делаем файловую систему контейнера только для чтения
+    # Всё, что нужно писать (pid, cache, temp) — вынесено в tmpfs
+    read_only: true
+
+    # tmpfs (writable в памяти) для временных файлов и pid
+    # /tmp — общий временный каталог
+    # /var/run — под pid/сокеты (или ты перенёс pid в /tmp/nginx.pid — тогда /var/run можно убрать)
+    # /var/cache/nginx — под временные кеши nginx
+    tmpfs:
+      - /tmp
+      - /var/run
+      - /var/cache/nginx
+
+    # Запрет повышения привилегий
+    security_opt:
+      - no-new-privileges:true
+
+
+# --- Docker сети ---
+networks:
+  # front_net: nginx <-> backend
+  front_net:
+  # back_net: backend <-> postgres
+  back_net:
+
+
+# --- Docker тома (persistent/shared) ---
+volumes:
+  # данные БД
+  postgres_data:
+  # статические файлы Django (collectstatic)
+  static_volume:
+  # медиа-файлы (uploads)
+  media_volume:
